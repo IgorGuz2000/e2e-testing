@@ -7,70 +7,130 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/elastic/e2e-testing/cli/config"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/cucumber/godog"
-	"github.com/elastic/e2e-testing/cli/docker"
-	"github.com/elastic/e2e-testing/cli/services"
-	shell "github.com/elastic/e2e-testing/cli/shell"
-	"github.com/elastic/e2e-testing/e2e"
-	"github.com/elastic/e2e-testing/e2e/steps"
+	"github.com/elastic/e2e-testing/internal/common"
+	"github.com/elastic/e2e-testing/internal/compose"
+	"github.com/elastic/e2e-testing/internal/docker"
+	"github.com/elastic/e2e-testing/internal/elasticsearch"
+	"github.com/elastic/e2e-testing/internal/installer"
+	"github.com/elastic/e2e-testing/internal/kibana"
+	"github.com/elastic/e2e-testing/internal/shell"
+	"github.com/elastic/e2e-testing/internal/utils"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
 // StandAloneTestSuite represents the scenarios for Stand-alone-mode
 type StandAloneTestSuite struct {
-	Cleanup  bool
-	Hostname string
-	Image    string
+	Cleanup     bool
+	Hostname    string
+	Image       string
+	FleetPolicy kibana.Policy
 	// date controls for queries
 	AgentStoppedDate             time.Time
 	RuntimeDependenciesStartDate time.Time
+	kibanaClient                 *kibana.Client
 }
 
 // afterScenario destroys the state created by a scenario
 func (sats *StandAloneTestSuite) afterScenario() {
-	serviceManager := services.NewServiceManager()
-	serviceName := ElasticAgentServiceName
+	serviceManager := compose.NewServiceManager()
+	serviceName := common.ElasticAgentServiceName
 
 	if log.IsLevelEnabled(log.DebugLevel) {
 		_ = sats.getContainerLogs()
 	}
 
+	developerMode := shell.GetEnvBool("DEVELOPER_MODE")
 	if !developerMode {
-		_ = serviceManager.RemoveServicesFromCompose(context.Background(), FleetProfileName, []string{serviceName}, profileEnv)
+		_ = serviceManager.RemoveServicesFromCompose(context.Background(), common.FleetProfileName, []string{serviceName}, common.ProfileEnv)
 	} else {
 		log.WithField("service", serviceName).Info("Because we are running in development mode, the service won't be stopped")
 	}
+
+	sats.kibanaClient.DeleteAllPolicies(sats.FleetPolicy)
 }
 
 func (sats *StandAloneTestSuite) contributeSteps(s *godog.ScenarioContext) {
 	s.Step(`^a "([^"]*)" stand-alone agent is deployed$`, sats.aStandaloneAgentIsDeployed)
-	s.Step(`^a "([^"]*)" stand-alone agent is deployed with fleet server mode$`, sats.aStandaloneAgentIsDeployedWithFleetServerMode)
+	s.Step(`^a "([^"]*)" stand-alone agent is deployed with fleet server mode$`, sats.bootstrapFleetServerFromAStandaloneAgent)
+	s.Step(`^a "([^"]*)" stand-alone agent is deployed with fleet server mode on cloud$`, sats.aStandaloneAgentIsDeployedWithFleetServerModeOnCloud)
 	s.Step(`^there is new data in the index from agent$`, sats.thereIsNewDataInTheIndexFromAgent)
 	s.Step(`^the "([^"]*)" docker container is stopped$`, sats.theDockerContainerIsStopped)
 	s.Step(`^there is no new data in the index after agent shuts down$`, sats.thereIsNoNewDataInTheIndexAfterAgentShutsDown)
-	s.Step(`^the stand-alone agent is listed in Fleet as "([^"]*)"$`, sats.theAgentIsListedInFleetWithStatus)
+	s.Step(`^the stand-alone agent is listed in Fleet as "([^"]*)"$`, sats.theStandaloneAgentIsListedInFleetWithStatus)
+	s.Step(`^the "([^"]*)" integration is added to the policy$`, sats.theIntegrationIsAddedToThePolicy)
+	s.Step(`^the "([^"]*)" datasource is shown in the policy$`, sats.thePolicyShowsTheDatasourceAdded)
 }
 
-func (sats *StandAloneTestSuite) theAgentIsListedInFleetWithStatus(desiredStatus string) error {
-	return theAgentIsListedInFleetWithStatus(desiredStatus, sats.Hostname)
+func (sats *StandAloneTestSuite) theIntegrationIsAddedToThePolicy(packageName string) error {
+	return theIntegrationIsOperatedInThePolicy(sats.kibanaClient, sats.FleetPolicy, packageName, "added")
 }
 
-func (sats *StandAloneTestSuite) aStandaloneAgentIsDeployedWithFleetServerMode(image string) error {
-	return sats.startAgent(image, map[string]string{"fleetServerMode": "1"})
+func (sats *StandAloneTestSuite) thePolicyShowsTheDatasourceAdded(packageName string) error {
+	return thePolicyShowsTheDatasourceAdded(sats.kibanaClient, sats.FleetPolicy, packageName)
+}
+
+func (sats *StandAloneTestSuite) aStandaloneAgentIsDeployedWithFleetServerModeOnCloud(image string) error {
+	fleetPolicy, err := sats.kibanaClient.GetDefaultPolicy(true)
+	if err != nil {
+		return err
+	}
+	sats.FleetPolicy = fleetPolicy
+	volume := path.Join(config.OpDir(), "compose", "services", "elastic-agent", "apm-legacy")
+	return sats.startAgent(image, "docker-compose-cloud.yml", map[string]string{"apmVolume": volume})
+}
+
+func (sats *StandAloneTestSuite) theStandaloneAgentIsListedInFleetWithStatus(desiredStatus string) error {
+	waitForAgents := func() error {
+		agents, err := sats.kibanaClient.ListAgents()
+		if err != nil {
+			return err
+		}
+
+		if len(agents) == 0 {
+			return errors.New("No agents found")
+		}
+
+		agentZero := agents[0]
+		hostname := agentZero.LocalMetadata.Host.HostName
+
+		return theAgentIsListedInFleetWithStatus(desiredStatus, hostname)
+	}
+	maxTimeout := time.Duration(common.TimeoutFactor) * time.Minute * 2
+	exp := common.GetExponentialBackOff(maxTimeout)
+
+	err := backoff.Retry(waitForAgents, exp)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sats *StandAloneTestSuite) bootstrapFleetServerFromAStandaloneAgent(image string) error {
+	fleetPolicy, err := sats.kibanaClient.GetDefaultPolicy(true)
+	if err != nil {
+		return err
+	}
+	sats.FleetPolicy = fleetPolicy
+	return sats.startAgent(image, "", map[string]string{"fleetServerMode": "1"})
 }
 
 func (sats *StandAloneTestSuite) aStandaloneAgentIsDeployed(image string) error {
-	return sats.startAgent(image, nil)
+	return sats.startAgent(image, "", nil)
 }
 
-func (sats *StandAloneTestSuite) startAgent(image string, env map[string]string) error {
+func (sats *StandAloneTestSuite) startAgent(image string, composeFilename string, env map[string]string) error {
 
 	log.Trace("Deploying an agent to Fleet")
 
-	dockerImageTag := agentVersion
+	dockerImageTag := common.AgentVersion
 
 	useCISnapshots := shell.GetEnvBool("BEATS_USE_CI_SNAPSHOTS")
 	beatsLocalPath := shell.GetEnv("BEATS_LOCAL_PATH", "")
@@ -78,40 +138,41 @@ func (sats *StandAloneTestSuite) startAgent(image string, env map[string]string)
 		// load the docker images that were already:
 		// a. downloaded from the GCP bucket
 		// b. fetched from the local beats binaries
-		dockerInstaller := GetElasticAgentInstaller("docker", image, agentVersion)
+		dockerInstaller := installer.GetElasticAgentInstaller("docker", image, common.AgentVersion, "")
 
 		dockerInstaller.PreInstallFn()
 
 		dockerImageTag += "-amd64"
 	}
 
-	serviceManager := services.NewServiceManager()
+	serviceManager := compose.NewServiceManager()
 
-	profileEnv["elasticAgentDockerImageSuffix"] = ""
+	common.ProfileEnv["elasticAgentDockerImageSuffix"] = ""
 	if image != "default" {
-		profileEnv["elasticAgentDockerImageSuffix"] = "-" + image
+		common.ProfileEnv["elasticAgentDockerImageSuffix"] = "-" + image
 	}
 
-	profileEnv["elasticAgentDockerNamespace"] = e2e.GetDockerNamespaceEnvVar()
+	common.ProfileEnv["elasticAgentDockerNamespace"] = utils.GetDockerNamespaceEnvVar("beats")
 
-	containerName := fmt.Sprintf("%s_%s_%d", FleetProfileName, ElasticAgentServiceName, 1)
+	containerName := fmt.Sprintf("%s_%s_%d", common.FleetProfileName, common.ElasticAgentServiceName, 1)
 
-	profileEnv["elasticAgentContainerName"] = containerName
-	profileEnv["elasticAgentPlatform"] = "linux/amd64"
-	profileEnv["elasticAgentTag"] = dockerImageTag
+	common.ProfileEnv["elasticAgentContainerName"] = containerName
+	common.ProfileEnv["elasticAgentPlatform"] = "linux/amd64"
+	common.ProfileEnv["elasticAgentTag"] = dockerImageTag
 
 	for k, v := range env {
-		profileEnv[k] = v
+		common.ProfileEnv[k] = v
 	}
 
-	err := serviceManager.AddServicesToCompose(context.Background(), FleetProfileName, []string{ElasticAgentServiceName}, profileEnv)
+	err := serviceManager.AddServicesToCompose(context.Background(), common.FleetProfileName,
+		[]string{common.ElasticAgentServiceName}, common.ProfileEnv, composeFilename)
 	if err != nil {
 		log.Error("Could not deploy the elastic-agent")
 		return err
 	}
 
 	// get container hostname once
-	hostname, err := steps.GetContainerHostname(containerName)
+	hostname, err := docker.GetContainerHostname(containerName)
 	if err != nil {
 		return err
 	}
@@ -129,16 +190,16 @@ func (sats *StandAloneTestSuite) startAgent(image string, env map[string]string)
 }
 
 func (sats *StandAloneTestSuite) getContainerLogs() error {
-	serviceManager := services.NewServiceManager()
+	serviceManager := compose.NewServiceManager()
 
-	profile := FleetProfileName
-	serviceName := ElasticAgentServiceName
+	profile := common.FleetProfileName
+	serviceName := common.ElasticAgentServiceName
 
 	composes := []string{
 		profile,     // profile name
 		serviceName, // agent service
 	}
-	err := serviceManager.RunCommand(profile, composes, []string{"logs", serviceName}, profileEnv)
+	err := serviceManager.RunCommand(profile, composes, []string{"logs", serviceName}, common.ProfileEnv)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"error":   err,
@@ -185,7 +246,7 @@ func (sats *StandAloneTestSuite) installTestTools(containerName string) error {
 }
 
 func (sats *StandAloneTestSuite) thereIsNewDataInTheIndexFromAgent() error {
-	maxTimeout := time.Duration(timeoutFactor) * time.Minute * 2
+	maxTimeout := time.Duration(common.TimeoutFactor) * time.Minute * 2
 	minimumHitsCount := 50
 
 	result, err := searchAgentData(sats.Hostname, sats.RuntimeDependenciesStartDate, minimumHitsCount, maxTimeout)
@@ -195,13 +256,13 @@ func (sats *StandAloneTestSuite) thereIsNewDataInTheIndexFromAgent() error {
 
 	log.Tracef("Search result: %v", result)
 
-	return e2e.AssertHitsArePresent(result)
+	return elasticsearch.AssertHitsArePresent(result)
 }
 
 func (sats *StandAloneTestSuite) theDockerContainerIsStopped(serviceName string) error {
-	serviceManager := services.NewServiceManager()
+	serviceManager := compose.NewServiceManager()
 
-	err := serviceManager.RemoveServicesFromCompose(context.Background(), FleetProfileName, []string{serviceName}, profileEnv)
+	err := serviceManager.RemoveServicesFromCompose(context.Background(), common.FleetProfileName, []string{serviceName}, common.ProfileEnv)
 	if err != nil {
 		return err
 	}
@@ -226,10 +287,10 @@ func (sats *StandAloneTestSuite) thereIsNoNewDataInTheIndexAfterAgentShutsDown()
 		return nil
 	}
 
-	return e2e.AssertHitsAreNotPresent(result)
+	return elasticsearch.AssertHitsAreNotPresent(result)
 }
 
-func searchAgentData(hostname string, startDate time.Time, minimumHitsCount int, maxTimeout time.Duration) (e2e.SearchResult, error) {
+func searchAgentData(hostname string, startDate time.Time, minimumHitsCount int, maxTimeout time.Duration) (elasticsearch.SearchResult, error) {
 	timezone := "America/New_York"
 
 	esQuery := map[string]interface{}{
@@ -306,11 +367,11 @@ func searchAgentData(hostname string, startDate time.Time, minimumHitsCount int,
 
 	indexName := "logs-elastic_agent-default"
 
-	result, err := e2e.WaitForNumberOfHits(context.Background(), indexName, esQuery, minimumHitsCount, maxTimeout)
+	result, err := elasticsearch.WaitForNumberOfHits(context.Background(), indexName, esQuery, minimumHitsCount, maxTimeout)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"error": err,
-		}).Warn(e2e.WaitForIndices())
+		}).Warn(elasticsearch.WaitForIndices())
 	}
 
 	return result, err

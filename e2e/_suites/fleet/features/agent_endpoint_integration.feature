@@ -120,7 +120,8 @@ Scenarios for Agent to deploy Endpoint and sending data to Fleet and Elasticsear
     And the host name is shown in the Administration view in the Security App as "online"
     When the host is restarted
     Then the "elastic-agent" process is in the "started" state on the host
-    And the "elastic-endpoint" process is in the "started" state on the host
+    # This Step is not supported with Docker the ticket number: https://github.com/elastic/e2e-testing/pull/947
+    #And the "elastic-endpoint" process is in the "started" state on the host
 
     @centos
     Examples: Centos

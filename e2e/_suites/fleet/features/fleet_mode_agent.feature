@@ -14,10 +14,10 @@ Examples: Centos
 | os     |
 | centos |
 
-@debian
-Examples: Debian
-| os     |
-| debian |
+#@debian
+#Examples: Debian
+#| os     |
+#| debian |
 
 @enroll
 Scenario Outline: Deploying the <os> agent with enroll and then run on rpm and deb

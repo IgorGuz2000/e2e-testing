@@ -7,6 +7,8 @@ package main
 import (
 	"context"
 	"fmt"
+	//"io/ioutil"
+	//"os"
 	"strings"
 	"time"
 
@@ -161,6 +163,10 @@ func (fts *FleetTestSuite) contributeSteps(s *godog.ScenarioContext) {
 	s.Step(`^the policy response will be shown in the Security App$`, fts.thePolicyResponseWillBeShownInTheSecurityApp)
 	s.Step(`^the policy is updated to have "([^"]*)" in "([^"]*)" mode$`, fts.thePolicyIsUpdatedToHaveMode)
 	s.Step(`^the policy will reflect the change in the Security App$`, fts.thePolicyWillReflectTheChangeInTheSecurityApp)
+
+	// System Integration steps
+	s.Step(`^the policy is updated to have "([^"]*)" set to "([^"]*)"$`, fts.thePolicyIsUpdatedToHaveSystemSet)
+	s.Step(`^we verify that "([^"]*)" with "([^"]*)" metrics in the datastreams$`, fts.theMetricsInTheDataStream)
 
 	// fleet server steps
 	s.Step(`^a "([^"]*)" agent is deployed to Fleet with "([^"]*)" installer in fleet-server mode$`, fts.anAgentIsDeployedToFleetWithInstallerInFleetMode)
@@ -1648,6 +1654,171 @@ func unenrollAgent(agentID string, force bool) error {
 	log.WithFields(log.Fields{
 		"agentID": agentID,
 	}).Debug("Fleet agent was unenrolled")
+
+	return nil
+}
+
+//func metricsInputs(integration string, set string) []kibana.Input {
+//	data := readJsonFile("metrics.json", integration, set)
+//	return []kibana.Input{
+//		{
+//			Type:    integration,
+//			Enabled: true,
+//			Streams: data,
+//		},
+//	}
+//
+//	return []kibana.Input{}
+//}
+
+//func readJsonFile(file string, integration string, set string) []interface{} {
+//	jsonFile, err := os.Open(file)
+//	if err != nil {
+//		fmt.Println(err)
+//	}
+//	fmt.Println("Successfully Opened metrics.json")
+//	defer jsonFile.Close()
+//	data, err := ioutil.ReadAll(jsonFile)
+//	if err != nil {
+//		log.Fatalf("error: %v", err)
+//	}
+//	jsonParsed, err := gabs.ParseJSON(data)
+//	if err != nil {
+//		log.Fatal("Unable to parse json")
+//	}
+//	children := jsonParsed.S("inputs").Children()
+//	for i, item := range children {
+//		//fmt.Println("TYPE: ", item.Path("type").Data().(string))
+//		if item.Path("type").Data().(string) == integration {
+//			for idx, stream := range item.S("streams").Children() {
+//				//fmt.Println("STREAM: ", stream)
+//				dataSet, _ := stream.Path("data_stream.dataset").Data().(string)
+//				//fmt.Println("DATASET: ", dataSet)
+//				if dataSet == "system."+set {
+//					jsonParsed.SetP(
+//						integration+"-system."+set+"-"+uuid.New().String(),
+//						fmt.Sprintf("inputs.%d.streams.%d.id", i, idx),
+//					)
+//					jsonParsed.SetP(
+//						true,
+//						fmt.Sprintf("inputs.%d.streams.%d.enabled", i, idx),
+//					)
+//					fmt.Println("Set values for id and enabled")
+//					fmt.Println("ID:", jsonParsed.Path(fmt.Sprintf("inputs.%d.streams.%d.id", i, idx)))
+//					fmt.Println("ENABLED:", jsonParsed.Path(fmt.Sprintf("inputs.%d.streams.%d.enabled", i, idx)))
+//					dataStreamOut, _ := jsonParsed.Path(fmt.Sprintf("inputs.%d.streams", i)).Data().([]interface{})
+//					//fmt.Println("DATA STREAM OUT", dataStreamOut)
+//					return dataStreamOut
+//				}
+//			}
+//		}
+//	}
+//	return nil
+//}
+
+func (fts *FleetTestSuite) thePolicyIsUpdatedToHaveSystemSet(name string, set string) error {
+	var condition = false
+	if name != "system/metrics" {
+		condition = true
+	}
+	if name != "logfile" {
+		condition = true
+	}
+	if name != "log" {
+		condition = true
+	}
+	fmt.Println(condition)
+	if condition != true {
+		log.WithFields(log.Fields{
+			"name": name,
+		}).Warn("We only support system system/metrics, log and logfile policy to be updated")
+		return godog.ErrPending
+	}
+
+	integration, err := getIntegrationFromAgentPolicy("system", fts.PolicyID)
+
+	if err != nil {
+		return err
+	}
+	fts.Integration = integration
+
+	integrationJSON := fts.Integration.json
+
+	log.WithFields(log.Fields{
+		"type":    name,
+		"dataset": "system." + set,
+	}).Info("Getting information about Policy package type " + name + " name with dataset system." + set)
+
+	fmt.Println(integrationJSON)
+
+	//for _, item := range integrationJSON. {
+	//	if item.Type == name {
+	//		packageDS.Inputs = metricsInputs(name, set)
+	//	}
+	//}
+	//log.WithFields(log.Fields{
+	//	"inputs": packageDS.Inputs,
+	//}).Info("Updating integration package config")
+	//
+	//updatedAt, err := UpdateIntegrationPackagePolicy(packageDS)
+	//if err != nil {
+	//	return err
+	//}
+
+	// we use a string because we are not able to process what comes in the event, so we will do
+	// an alphabetical order, as they share same layout but different millis and timezone format
+	//fts.PolicyUpdatedAt = updatedAt
+	//
+	//log.WithFields(log.Fields{
+	//	"dataset": "system." + set,
+	//	"enabled": "true",
+	//	"type":    "metrics",
+	//}).Info("Policy Updated with package name system." + set)
+	//
+	return nil
+}
+
+func (fts *FleetTestSuite) theMetricsInTheDataStream(name string, set string) error {
+	var TimeoutFactor = 3
+	timeNow := time.Now()
+	startTime := timeNow.Unix()
+
+	waitForDataStreams := func() error {
+		var exist = false
+		dataStreams, _ := getDataStreams()
+
+		for _, item := range dataStreams.Children() {
+			//fmt.Println(item.Path("dataset"))
+			if item.Path("dataset").Data().(string) == "system."+set {
+				log.WithFields(log.Fields{
+					"dataset": "system." + set,
+					"enabled": "true",
+					"type":    name,
+				}).Info("The " + name + "with value system." + set + " in the metrics")
+
+				if int64(int64(item.Path("last_activity_ms").Data().(float64))) > startTime {
+					log.WithField(
+						"Activity Time stamp for the "+name+"system."+name, "Is valid",
+					).Info("The " + name + "with value system." + set + " in the metrics")
+				}
+				exist = true
+				break
+			}
+		}
+
+		if exist != true {
+			return errors.New("No" + name + " with value system." + set + " found in the metrics")
+		}
+		return nil
+
+	}
+	maxTimeout := time.Duration(TimeoutFactor) * time.Minute * 2
+	exp := e2e.GetExponentialBackOff(maxTimeout)
+
+	err := backoff.Retry(waitForDataStreams, exp)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }

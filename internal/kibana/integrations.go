@@ -191,8 +191,9 @@ func (c *Client) GetMetadataFromSecurityApp(ctx context.Context) ([]SecurityEndp
 	})
 	defer span.End()
 
-	reqBody := `{}`
-	statusCode, respBody, err := c.post(ctx, fmt.Sprintf("%s/metadata", EndpointAPI), []byte(reqBody))
+	//reqBody := `{}`
+	//statusCode, respBody, err := c.post(ctx, fmt.Sprintf("%s/metadata", EndpointAPI), []byte(reqBody))
+	statusCode, respBody, err := c.get(ctx, fmt.Sprintf("%s/metadata", EndpointAPI))
 	if err != nil {
 		return []SecurityEndpoint{}, errors.Wrap(err, "could not get endpoint metadata")
 	}
@@ -257,6 +258,7 @@ func (c *Client) IsAgentListedInSecurityApp(ctx context.Context, hostName string
 	defer span.End()
 
 	hosts, err := c.GetMetadataFromSecurityApp(ctx)
+	fmt.Println(hosts)
 	if err != nil {
 		return SecurityEndpoint{}, err
 	}
@@ -313,6 +315,7 @@ func (c *Client) IsPolicyResponseListedInSecurityApp(ctx context.Context, agentI
 		return false, err
 	}
 
+	fmt.Println(hosts)
 	for _, host := range hosts {
 		metadataAgentID := host.Metadata.Elastic.Agent.ID
 		name := host.Metadata.Endpoint.Policy.Applied.Name
